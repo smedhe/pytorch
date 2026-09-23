@@ -187,6 +187,8 @@ class InputFingerprint(NamedTuple):
     has_unknown: bool = False
     # TreeSpec from pytree.tree_flatten of the (args, kwargs) structure.
     treespec: pytree.TreeSpec | None = None
+    # Debug descriptions for leaves that made has_unknown true.
+    unknown_vt_descriptions: list[str] | None = None
 
 
 def is_constant_like(
@@ -293,12 +295,17 @@ def build_fingerprint_with_pytree(
     flat_vts: list[tuple[InputTag, VariableTracker]] = []
     arg_sources: list[Source | None] = []
     has_unknown = False
+    unknown_vt_descriptions: list[str] = []
+
+    def describe_unknown_vt(vt: VariableTracker) -> str:
+        return f"{type(vt).__name__}(source={getattr(vt, 'source', None)!r}, vt={vt!r})"
 
     def add_leaf(vt: VariableTracker) -> None:
         nonlocal has_unknown
         tag = classify_vt(vt)
         if tag is None:
             has_unknown = True
+            unknown_vt_descriptions.append(describe_unknown_vt(vt))
         else:
             flat_vts.append((tag, vt))
             # Always append (even None) to keep positional alignment with flat_vts.
@@ -310,6 +317,7 @@ def build_fingerprint_with_pytree(
             node_type = node_vt.python_type()
         except NotImplementedError:
             has_unknown = True
+            unknown_vt_descriptions.append(describe_unknown_vt(node_vt))
             return pytree.treespec_leaf()
         # Keep in sync with pytree._get_node_type.
         if pytree.is_namedtuple_class(node_type):
@@ -344,7 +352,13 @@ def build_fingerprint_with_pytree(
     container_vt = SourcelessBuilder.create(tx, (list(fn_args_vt), kwargs))
     treespec = flatten(container_vt)
 
-    return InputFingerprint(flat_vts, arg_sources, has_unknown, treespec)
+    return InputFingerprint(
+        flat_vts,
+        arg_sources,
+        has_unknown,
+        treespec,
+        unknown_vt_descriptions or None,
+    )
 
 
 def sym_num_key(sym_num: Any) -> Any:
@@ -513,7 +527,8 @@ def is_reuse_eligible(
 
     if fingerprint.has_unknown:
         hc_log.debug(
-            "subgraph_reuse: not eligible -- unsupported input VT types",
+            "subgraph_reuse: not eligible -- unsupported input VT types: %s",
+            fingerprint.unknown_vt_descriptions,
         )
         return False
 
@@ -1242,6 +1257,7 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
         kwargs: dict[str, VariableTracker],
         body_gmod: GraphModule,
         attr_name: str,
+        reuse_group_key: int | None = None,
     ) -> str:
         # Check if the subgraph from speculate_subgraph (body_gmod) and the fake
         # inputs have already been seen before. If yes, the subgraph is already
@@ -1272,12 +1288,23 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
                 )
             fn_code = fn_vt.value.forward.__func__.__code__  # type: ignore[attr-defined]
             fn_name = fn_vt.value.forward.__name__  # type: ignore[attr-defined]
+        if reuse_group_key is not None:
+            body_gmod.meta["invoke_subgraph_reuse_group_key"] = reuse_group_key
+
         # pyrefly: ignore [implicit-any]
         previously_installed_submodules = []
         if invoke_subgraph_cache:
             previously_installed_submodules = (
-                invoke_subgraph_cache.get_dynamo_installed_submodules(fn_code)
+                invoke_subgraph_cache.get_dynamo_installed_submodules(
+                    fn_code, reuse_group_key
+                )
             )
+            if reuse_group_key is not None:
+                hc_log.debug(
+                    "subgraph_reuse: install lookup for '%s' using reuse group key %s",
+                    fn_name,
+                    reuse_group_key,
+                )
             current_mod = body_gmod
             # NB - reverse is more likely to cause a hit sooner because first
             # graph can have requires_grad=False for a few inputs
@@ -1301,7 +1328,7 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
                     return submodule_name
 
         body_name = super().install_subgraph_in_output_graph(
-            tx, fn_vt, fn_args_vt, kwargs, body_gmod, "subgraph"
+            tx, fn_vt, fn_args_vt, kwargs, body_gmod, attr_name
         )
         hc_log.debug(
             "%s: Installing subgraph with identifier '%s', bringing total count for '%s' function to %s",
@@ -1311,7 +1338,9 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
             len(previously_installed_submodules) + 1,
         )
         if invoke_subgraph_cache:
-            invoke_subgraph_cache.add_dynamo_installed_submodule(fn_code, body_name)
+            invoke_subgraph_cache.add_dynamo_installed_submodule(
+                fn_code, body_name, reuse_group_key
+            )
 
         return body_name
 
@@ -1351,7 +1380,21 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
 
         # TODO (anijain2305) - Collect issues why this does not work for export,
         # and enable if request arises.
-        reuse = not tx.output.export
+        hc_log.debug("reuse_hash_fn for %s: %s", fn_var, reuse_hash_fn)
+        is_export = tx.output.export or torch.compiler.is_exporting()
+        reuse = not is_export
+        export_reuse_group_key = None
+
+        if is_export and reuse_hash_fn is not None:
+            with dynamo_timed("invoke_subgraph_export_reuse_hash_fn"):
+                export_reuse_group_key = trace_reuse_hash_fn(
+                    tx, reuse_hash_fn, fn_args_vt, kwargs
+                )
+            hc_log.debug(
+                "subgraph_reuse: export reuse_hash_fn key %d for '%s'",
+                export_reuse_group_key,
+                fn_var,
+            )
 
         # User-provided reuse_hash_fn path: hash key determines cache lookup.
         if reuse and reuse_hash_fn is not None:
@@ -1392,6 +1435,9 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
 
         if self._HOP_NAME is None:
             raise AssertionError("_HOP_NAME must not be None")
+        subgraph_name = "subgraph"
+        if export_reuse_group_key is not None:
+            subgraph_name = f"{subgraph_name}_{export_reuse_group_key}"
         with dynamo_timed("invoke_subgraph_trace"):
             (
                 p_args,
@@ -1402,7 +1448,15 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
                 body_name,
                 body_graph_output_vts,
                 tracing_info,
-            ) = self.create_wrapped_node(tx, fn_var, fn_args_vt, kwargs, self._HOP_NAME)
+            ) = self.create_wrapped_node(
+                tx,
+                fn_var,
+                fn_args_vt,
+                kwargs,
+                self._HOP_NAME,
+                subgraph_name=subgraph_name,
+                install_subgraph_kwargs={"reuse_group_key": export_reuse_group_key},
+            )
 
         if len(p_kwargs) > 0:
             unimplemented(

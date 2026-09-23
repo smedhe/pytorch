@@ -995,9 +995,10 @@ def _(subgraph, identifier, *operands):
 
     # Check if we have already traced the subgraph.
     invoke_subgraph_cache = get_invoke_subgraph_cache()
+    autograd_cache_key = (identifier, id(subgraph), len(operands))
     if invoke_subgraph_cache:
         if saved_autograd_fn := invoke_subgraph_cache.get_autograd_key_entry(
-            identifier
+            autograd_cache_key
         ):
             return saved_autograd_fn(*operands)
 
@@ -1010,7 +1011,9 @@ def _(subgraph, identifier, *operands):
 
     # Save the autograd_fn_callable in the dispatch set cache.
     if invoke_subgraph_cache:
-        invoke_subgraph_cache.add_autograd_key_entry(identifier, autograd_fn_callable)
+        invoke_subgraph_cache.add_autograd_key_entry(
+            autograd_cache_key, autograd_fn_callable
+        )
 
     return autograd_fn_callable(*operands)
 
@@ -1226,8 +1229,20 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     # Check if we have already traced the subgraph.
     graph = None
     invoke_subgraph_cache = get_invoke_subgraph_cache()
+    orig_subgraph = (
+        subgraph.subgraph if isinstance(subgraph, FunctionalizeCtxWrapper) else subgraph
+    )
+    reuse_group_key = None
+    if (
+        isinstance(orig_subgraph, torch.fx.GraphModule)
+        and hasattr(orig_subgraph, "meta")
+        and "invoke_subgraph_reuse_group_key" in orig_subgraph.meta
+    ):
+        reuse_group_key = orig_subgraph.meta["invoke_subgraph_reuse_group_key"]
     if invoke_subgraph_cache:
-        graph = invoke_subgraph_cache.get_proxy_dispatch_entry(identifier)
+        graph = invoke_subgraph_cache.get_proxy_dispatch_entry(
+            identifier, reuse_group_key
+        )
 
     if graph is None:
         from torch._dynamo.utils import dynamo_timed
@@ -1272,7 +1287,9 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
                 f"expected proxy_mode.tracer to be torch.fx.Tracer, got {type(proxy_mode.tracer)}"
             )
         if invoke_subgraph_cache:
-            invoke_subgraph_cache.add_proxy_dispatch_entry(identifier, graph)
+            invoke_subgraph_cache.add_proxy_dispatch_entry(
+                identifier, graph, reuse_group_key
+            )
 
     node_args = (graph, identifier, *operands)
 
@@ -1317,9 +1334,6 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     # module (set by InvokeSubgraphAutogradOp.backward) but may be wrapped
     # by FunctionalizeCtxWrapper — unwrap to find it.
     nested_config = None
-    orig_subgraph = (
-        subgraph.subgraph if isinstance(subgraph, FunctionalizeCtxWrapper) else subgraph
-    )
     for gm in (graph, orig_subgraph):
         if (
             isinstance(gm, torch.fx.GraphModule)

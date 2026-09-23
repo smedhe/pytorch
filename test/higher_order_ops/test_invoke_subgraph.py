@@ -5226,6 +5226,88 @@ class GraphModule(torch.nn.Module):
         )
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+    def test_reuse_hash_fn_partitions_export_repeated_subgraphs(self):
+        class Dense(torch.nn.Module):
+            reuse_group_key = 0
+
+            def forward(self, x):
+                return x.sin() + 1
+
+        class Moe(torch.nn.Module):
+            reuse_group_key = 1
+
+            def forward(self, x):
+                return x.cos() + 2
+
+        def reuse_hash_fn(layer, x):
+            return layer.reuse_group_key
+
+        @nested_compile_region(reuse_hash_fn=reuse_hash_fn)
+        def layer_fn(layer, x):
+            return layer(x)
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [Dense(), Dense(), Moe(), Dense(), Moe()]
+                )
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer_fn(layer, x)
+                return x
+
+        mod = M()
+        x = torch.randn(8)
+
+        ep = torch.export.export(mod, (x,), strict=self.strict)
+
+        self.assertEqual(ep.module()(x), mod(x))
+        repeated_subgraphs = {
+            name
+            for name, _ in ep.graph_module.named_modules()
+            if name.startswith("repeated_subgraph")
+        }
+        self.assertEqual(
+            repeated_subgraphs, {"repeated_subgraph0", "repeated_subgraph1"}
+        )
+
+    def test_graph_module_comparison_ignores_storage_bytes(self):
+        from torch._dynamo.variables.higher_order_ops import are_same_graph_modules
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        def make_graph(example_value):
+            graph = torch.fx.Graph()
+            x = graph.placeholder("x")
+            x.meta["example_value"] = example_value
+            sin = graph.call_function(torch.ops.aten.sin.default, (x,))
+            graph.output((sin,))
+            return torch.fx.GraphModule({}, graph)
+
+        small_storage = torch.empty(2)
+        large_storage = torch.as_strided(torch.empty(100), (2,), (1,), 0)
+
+        with FakeTensorMode() as fake_mode:
+            small_fake = fake_mode.from_tensor(small_storage)
+            large_fake = fake_mode.from_tensor(large_storage)
+
+        self.assertEqual(small_fake.shape, large_fake.shape)
+        self.assertEqual(small_fake.stride(), large_fake.stride())
+        self.assertNotEqual(
+            small_fake.untyped_storage().nbytes(),
+            large_fake.untyped_storage().nbytes(),
+        )
+        self.assertTrue(
+            are_same_graph_modules(
+                "storage_bytes",
+                make_graph(small_fake),
+                make_graph(large_fake),
+                fake_mode,
+            )
+        )
+
+    @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_unbacked(self):
         @nested_compile_region
         def gn(x, y):

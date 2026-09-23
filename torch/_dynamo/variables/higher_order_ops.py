@@ -1022,38 +1022,188 @@ def _call_while_loop(
     )
 
 
+# Graph call compatibility checks whether an already-installed subgraph can
+# be called with a new set of placeholders. Backing storage capacity is
+# not part of the callable tensor interface; shape, stride, dtype, device,
+# layout, storage_offset, and other logical tensor metadata still match.
+_GRAPH_CALL_COMPATIBLE_TENSOR_METADATA_EXCLUDED_FIELDS = frozenset({"storage_bytes"})
+
+
+def _normalize_symbolic_graph_metadata_value(
+    value: Any, symbol_map: dict[str, str]
+) -> Any:
+    import re
+
+    import sympy
+
+    node = getattr(value, "node", None)
+    if node is None:
+        return (type(value), repr(value))
+
+    expr = getattr(node, "_expr", None)
+    if expr is None:
+        return (type(value), repr(value))
+
+    expr_str = str(sympy.simplify(expr))
+
+    def replace_symbol(match: re.Match[str]) -> str:
+        symbol = match.group(0)
+        if symbol not in symbol_map:
+            symbol_map[symbol] = f"_s{len(symbol_map)}"
+        return symbol_map[symbol]
+
+    expr_str = re.sub(r"\bs\d+\b", replace_symbol, expr_str)
+    pytype = getattr(value, "ty", getattr(node, "pytype", type(value)))
+    return (
+        type(value),
+        pytype,
+        getattr(node, "constant", None),
+        str(sympy.simplify(expr_str)),
+    )
+
+
+def _normalize_graph_metadata_value(value: Any, symbol_map: dict[str, str]) -> Any:
+    from torch._subclasses._fake_tensor_utils import _PySymInputStub
+
+    if isinstance(value, _PySymInputStub):
+        return (
+            _PySymInputStub,
+            _normalize_symbolic_graph_metadata_value(value.value, symbol_map),
+        )
+    return value
+
+
+def _flatten_graph_metadata_value_for_call_compatibility(
+    value: Any, fake_mode: "FakeTensorMode"
+) -> list[Any]:
+    from torch._subclasses._fake_tensor_utils import _CacheKeyState
+
+    result: list[Any] = []
+    state = _CacheKeyState(fake_mode.shape_env)
+    if isinstance(value, (tuple, list, torch.Size)):
+        id_hashed_objects: list[Any] = []
+        fake_mode._prep_args_for_hash(result, value, state, id_hashed_objects)
+        id_hashed_objects.clear()
+    elif isinstance(value, torch.SymInt):
+        state.convert_sym_int(result, value)
+    else:
+        result.append(value)
+    return result
+
+
+def _normalize_tensor_metadata_for_graph_call_compatibility(
+    metadata: Any, fake_mode: "FakeTensorMode"
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    import dataclasses
+
+    symbol_map: dict[str, str] = {}
+    result = []
+    for field in dataclasses.fields(metadata):
+        if field.name in _GRAPH_CALL_COMPATIBLE_TENSOR_METADATA_EXCLUDED_FIELDS:
+            result.append((field.name, ("<ignored>",)))
+            continue
+        flattened = _flatten_graph_metadata_value_for_call_compatibility(
+            getattr(metadata, field.name), fake_mode
+        )
+        result.append(
+            (
+                field.name,
+                tuple(
+                    _normalize_graph_metadata_value(value, symbol_map)
+                    for value in flattened
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def _tensor_metadata_graph_call_mismatch(
+    a_metadata: Any, b_metadata: Any, fake_mode: "FakeTensorMode"
+) -> str | None:
+    a_normalized = _normalize_tensor_metadata_for_graph_call_compatibility(
+        a_metadata, fake_mode
+    )
+    b_normalized = _normalize_tensor_metadata_for_graph_call_compatibility(
+        b_metadata, fake_mode
+    )
+    if a_normalized == b_normalized:
+        return None
+
+    for idx, (a_item, b_item) in enumerate(zip(a_normalized, b_normalized)):
+        if a_item != b_item:
+            return (
+                f"idx={idx}: {a_item!r} ({type(a_item).__name__})"
+                f" != {b_item!r} ({type(b_item).__name__})"
+            )
+    return (
+        f"metadata length mismatch: {len(a_normalized)}"
+        f" != {len(b_normalized)}"
+    )
+
+
 def are_same_graph_modules(
     fn_name: str, a_mod: GraphModule, b_mod: GraphModule, fake_mode: "FakeTensorMode"
 ) -> bool:
     from torch._subclasses._fake_tensor_utils import _CacheKeyState
     from torch._subclasses.fake_tensor import extract_tensor_metadata
 
+    def log_mismatch(
+        reason: str,
+        a_node: torch.fx.Node | None = None,
+        b_node: torch.fx.Node | None = None,
+    ) -> None:
+        hc_log.debug(
+            "%s: Graph comparison failed: %s; a_node=%s; b_node=%s",
+            fn_name,
+            reason,
+            a_node,
+            b_node,
+        )
+
     # Maps the equivalent nodes from a to b
     # pyrefly: ignore [implicit-any]
     node_map = {}
 
-    def check_all_args(a_nodes: Iterable[Any], b_nodes: Iterable[Any]) -> bool:
-        for arg_a, arg_b in zip(a_nodes, b_nodes):
+    def check_all_args(a_nodes: Iterable[Any], b_nodes: Iterable[Any]) -> str | None:
+        a_nodes = list(a_nodes)
+        b_nodes = list(b_nodes)
+        if len(a_nodes) != len(b_nodes):
+            return f"arg length mismatch: {len(a_nodes)} != {len(b_nodes)}"
+        for idx, (arg_a, arg_b) in enumerate(zip(a_nodes, b_nodes)):
             if isinstance(arg_a, torch.fx.Node):
-                if node_map[arg_a] != arg_b:
-                    return False
+                mapped = node_map.get(arg_a)
+                if mapped != arg_b:
+                    return (
+                        f"arg {idx} node mismatch: "
+                        f"{arg_a} maps to {mapped}, got {arg_b}"
+                    )
             elif isinstance(arg_a, slice):
                 if not isinstance(arg_b, slice):
-                    return False
-                if not check_all_args(
+                    return f"arg {idx} slice mismatch: {arg_a} != {arg_b}"
+                nested = check_all_args(
                     (arg_a.start, arg_a.stop, arg_a.step),
                     (arg_b.start, arg_b.stop, arg_b.step),
-                ):
-                    return False
+                )
+                if nested is not None:
+                    return f"arg {idx} slice mismatch: {nested}"
             elif arg_a != arg_b:
                 # This is a catch-all for everything else. `slice` was a
                 # surprise but can there be other data structures that can
                 # contain fx.Nodes in them?
-                return False
-        return True
+                return f"arg {idx} value mismatch: {arg_a!r} != {arg_b!r}"
+        return None
 
-    for a_node, b_node in zip(a_mod.graph.nodes, b_mod.graph.nodes):
+    a_graph_nodes = list(a_mod.graph.nodes)
+    b_graph_nodes = list(b_mod.graph.nodes)
+    if len(a_graph_nodes) != len(b_graph_nodes):
+        log_mismatch(
+            f"node count mismatch: {len(a_graph_nodes)} != {len(b_graph_nodes)}"
+        )
+        return False
+
+    for a_node, b_node in zip(a_graph_nodes, b_graph_nodes):
         if a_node.op != b_node.op:
+            log_mismatch(f"op mismatch: {a_node.op} != {b_node.op}", a_node, b_node)
             return False
 
         if a_node.op == "placeholder":
@@ -1062,6 +1212,12 @@ def are_same_graph_modules(
 
             if isinstance(a_value, torch.Tensor):
                 if not isinstance(b_value, torch.Tensor):
+                    log_mismatch(
+                        "placeholder type mismatch: "
+                        f"tensor != {type(b_value).__name__}",
+                        a_node,
+                        b_node,
+                    )
                     return False
                 # Extract fake tensor metadata for a and b and then compare
                 # pyrefly: ignore [implicit-any]
@@ -1074,51 +1230,81 @@ def are_same_graph_modules(
                 state = _CacheKeyState(fake_mode.shape_env)
                 b_metadata = extract_tensor_metadata(b_value)
                 b_metadata._flatten_into(b_result, fake_mode, state)
-                if a_result != b_result:
+                mismatch_detail = _tensor_metadata_graph_call_mismatch(
+                    a_metadata, b_metadata, fake_mode
+                )
+                if mismatch_detail is not None:
+                    log_mismatch(
+                        f"placeholder tensor metadata mismatch: {mismatch_detail}; "
+                        f"{a_result} != {b_result}",
+                        a_node,
+                        b_node,
+                    )
                     return False
             elif isinstance(a_value, torch.SymInt):
                 if not isinstance(b_value, torch.SymInt):
+                    log_mismatch(
+                        "placeholder type mismatch: "
+                        f"SymInt != {type(b_value).__name__}",
+                        a_node,
+                        b_node,
+                    )
                     return False
-                if a_value is not b_value:
+                if _normalize_symbolic_graph_metadata_value(
+                    a_value, {}
+                ) != _normalize_symbolic_graph_metadata_value(b_value, {}):
+                    log_mismatch(
+                        f"placeholder SymInt mismatch: {a_value!r} != {b_value!r}",
+                        a_node,
+                        b_node,
+                    )
                     return False
         elif a_node.op == "call_function":
             if a_node.target is not b_node.target:
+                log_mismatch(
+                    f"call_function target mismatch: {a_node.target} != {b_node.target}",
+                    a_node,
+                    b_node,
+                )
                 return False
             a_flat, _ = pytree.tree_flatten((a_node.args, a_node.kwargs))
             b_flat, _ = pytree.tree_flatten((b_node.args, b_node.kwargs))
-            if not check_all_args(a_flat, b_flat):
-                hc_log.debug(
-                    "%s: Graph comparison failed at node (call_function): %s",
-                    fn_name,
-                    a_node,
-                )
+            if reason := check_all_args(a_flat, b_flat):
+                log_mismatch(reason, a_node, b_node)
                 return False
         elif a_node.op == "call_method":
             if a_node.target != b_node.target:
+                log_mismatch(
+                    f"call_method target mismatch: {a_node.target} != {b_node.target}",
+                    a_node,
+                    b_node,
+                )
                 return False
             a_flat, _ = pytree.tree_flatten((a_node.args, a_node.kwargs))
             b_flat, _ = pytree.tree_flatten((b_node.args, b_node.kwargs))
-            if not check_all_args(a_flat, b_flat):
-                hc_log.debug(
-                    "%s: Graph comparison failed at node (call_method) : %s",
-                    fn_name,
-                    a_node,
-                )
+            if reason := check_all_args(a_flat, b_flat):
+                log_mismatch(reason, a_node, b_node)
                 return False
         elif a_node.op == "output":
             a_flat, _ = pytree.tree_flatten((a_node.args, a_node.kwargs))
             b_flat, _ = pytree.tree_flatten((b_node.args, b_node.kwargs))
-            if not check_all_args(a_flat, b_flat):
-                hc_log.debug("%s: Graph comparison failed at the output node", fn_name)
+            if reason := check_all_args(a_flat, b_flat):
+                log_mismatch(reason, a_node, b_node)
                 return False
         elif a_node.op == "get_attr":
             a_attr = getattr(a_mod, a_node.target)
             b_attr = getattr(b_mod, b_node.target)
             if isinstance(a_attr, torch.fx.GraphModule):
                 if not isinstance(b_attr, torch.fx.GraphModule):
+                    log_mismatch(
+                        f"get_attr type mismatch: GraphModule != {type(b_attr).__name__}",
+                        a_node,
+                        b_node,
+                    )
                     return False
                 # This is an example of a HOP inside a HOP
                 if not are_same_graph_modules(fn_name, a_attr, b_attr, fake_mode):
+                    log_mismatch("nested get_attr graph mismatch", a_node, b_node)
                     return False
             else:
                 # TODO - write an example with tensor as a graph attribute in
@@ -3815,6 +4001,7 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         set_subgraph_inputs: Literal[
             "automatic", "automatic_with_forced_inputs"
         ] = "automatic",
+        install_subgraph_kwargs: dict[str, Any] | None = None,
     ) -> tuple[
         tuple[Proxy, ...],
         dict[str, VariableTracker],
@@ -3856,6 +4043,7 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             kwargs,
             body_gmod,
             attr_name=subgraph_name,
+            **(install_subgraph_kwargs or {}),
         )
         body_node = make_attr(tx, body_name)
 

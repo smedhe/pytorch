@@ -748,23 +748,32 @@ class GuardsContext(Checkpointable[GuardsCheckpointState]):
 class HopSubgraphCache:
     @abstractmethod
     def add_dynamo_installed_submodule(
-        self, fn_code: CodeType, identifier: str
+        self,
+        fn_code: CodeType,
+        identifier: str,
+        reuse_group_key: int | None = None,
     ) -> None: ...
 
     @abstractmethod
-    def get_dynamo_installed_submodules(self, fn_code: CodeType) -> list[str]: ...
+    def get_dynamo_installed_submodules(
+        self, fn_code: CodeType, reuse_group_key: int | None = None
+    ) -> list[str]: ...
 
     @abstractmethod
-    def add_autograd_key_entry(self, identifier: str, key: Callable) -> None: ...
+    def add_autograd_key_entry(self, identifier: object, key: Callable) -> None: ...
 
     @abstractmethod
-    def get_autograd_key_entry(self, identifier: str) -> Callable | None: ...
+    def get_autograd_key_entry(self, identifier: object) -> Callable | None: ...
 
     @abstractmethod
-    def add_proxy_dispatch_entry(self, identifier: str, key: Callable) -> None: ...
+    def add_proxy_dispatch_entry(
+        self, identifier: str, key: Callable, reuse_group_key: int | None = None
+    ) -> None: ...
 
     @abstractmethod
-    def get_proxy_dispatch_entry(self, identifier: str) -> Callable | None: ...
+    def get_proxy_dispatch_entry(
+        self, identifier: str, reuse_group_key: int | None = None
+    ) -> Callable | None: ...
 
     @abstractmethod
     def add_functionalize_schema_entry(
@@ -845,10 +854,12 @@ class InvokeSubgraphReuseCondition:
 
 class InvokeSubgraphCache(HopSubgraphCache):
     def __init__(self) -> None:
-        self.autograd_cache: dict[str, Callable] = {}
-        self.proxy_dispatch_cache: dict[str, Callable] = {}
+        self.autograd_cache: dict[object, Callable] = {}
+        self.proxy_dispatch_cache: dict[tuple[str, int | None], Callable] = {}
         self.functionalize_schema_cache: dict[object, torch._C.FunctionSchema] = {}
-        self.dynamo_installed_submodules: dict[CodeType, list[str]] = defaultdict(list)
+        self.dynamo_installed_submodules: dict[
+            tuple[CodeType, int | None], list[str]
+        ] = defaultdict(list)
         self.lazy_bwd_cache: dict[
             str, dict[tuple[object], tuple[torch.fx.GraphModule, int]]
         ] = defaultdict(dict)
@@ -868,24 +879,33 @@ class InvokeSubgraphCache(HopSubgraphCache):
         ] = defaultdict(dict)
 
     def add_dynamo_installed_submodule(
-        self, fn_code: CodeType, identifier: str
+        self,
+        fn_code: CodeType,
+        identifier: str,
+        reuse_group_key: int | None = None,
     ) -> None:
-        self.dynamo_installed_submodules[fn_code].append(identifier)
+        self.dynamo_installed_submodules[(fn_code, reuse_group_key)].append(identifier)
 
-    def get_dynamo_installed_submodules(self, fn_code: CodeType) -> list[str]:
-        return self.dynamo_installed_submodules.get(fn_code, [])
+    def get_dynamo_installed_submodules(
+        self, fn_code: CodeType, reuse_group_key: int | None = None
+    ) -> list[str]:
+        return self.dynamo_installed_submodules.get((fn_code, reuse_group_key), [])
 
-    def add_autograd_key_entry(self, identifier: str, key: Callable) -> None:
+    def add_autograd_key_entry(self, identifier: object, key: Callable) -> None:
         self.autograd_cache[identifier] = key
 
-    def get_autograd_key_entry(self, identifier: str) -> Callable | None:
+    def get_autograd_key_entry(self, identifier: object) -> Callable | None:
         return self.autograd_cache.get(identifier, None)
 
-    def add_proxy_dispatch_entry(self, identifier: str, key: Callable) -> None:
-        self.proxy_dispatch_cache[identifier] = key
+    def add_proxy_dispatch_entry(
+        self, identifier: str, key: Callable, reuse_group_key: int | None = None
+    ) -> None:
+        self.proxy_dispatch_cache[(identifier, reuse_group_key)] = key
 
-    def get_proxy_dispatch_entry(self, identifier: str) -> Callable | None:
-        return self.proxy_dispatch_cache.get(identifier, None)
+    def get_proxy_dispatch_entry(
+        self, identifier: str, reuse_group_key: int | None = None
+    ) -> Callable | None:
+        return self.proxy_dispatch_cache.get((identifier, reuse_group_key), None)
 
     def add_functionalize_schema_entry(
         self, key: object, schema: torch._C.FunctionSchema
