@@ -884,12 +884,14 @@ class InvokeSubgraphCache(HopSubgraphCache):
         identifier: str,
         reuse_group_key: int | None = None,
     ) -> None:
-        self.dynamo_installed_submodules[(fn_code, reuse_group_key)].append(identifier)
+        cache_key = (fn_code, reuse_group_key)
+        self.dynamo_installed_submodules[cache_key].append(identifier)
 
     def get_dynamo_installed_submodules(
         self, fn_code: CodeType, reuse_group_key: int | None = None
     ) -> list[str]:
-        return self.dynamo_installed_submodules.get((fn_code, reuse_group_key), [])
+        cache_key = (fn_code, reuse_group_key)
+        return self.dynamo_installed_submodules.get(cache_key, [])
 
     def add_autograd_key_entry(self, identifier: object, key: Callable) -> None:
         self.autograd_cache[identifier] = key
@@ -900,12 +902,14 @@ class InvokeSubgraphCache(HopSubgraphCache):
     def add_proxy_dispatch_entry(
         self, identifier: str, key: Callable, reuse_group_key: int | None = None
     ) -> None:
-        self.proxy_dispatch_cache[(identifier, reuse_group_key)] = key
+        cache_key = (identifier, reuse_group_key)
+        self.proxy_dispatch_cache[cache_key] = key
 
     def get_proxy_dispatch_entry(
         self, identifier: str, reuse_group_key: int | None = None
     ) -> Callable | None:
-        return self.proxy_dispatch_cache.get((identifier, reuse_group_key), None)
+        cache_key = (identifier, reuse_group_key)
+        return self.proxy_dispatch_cache.get(cache_key, None)
 
     def add_functionalize_schema_entry(
         self, key: object, schema: torch._C.FunctionSchema

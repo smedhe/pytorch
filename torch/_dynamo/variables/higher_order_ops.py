@@ -1058,7 +1058,7 @@ def _normalize_symbolic_graph_metadata_value(
         type(value),
         pytype,
         getattr(node, "constant", None),
-        str(sympy.simplify(expr_str)),
+        expr_str,
     )
 
 
@@ -1144,7 +1144,6 @@ def _tensor_metadata_graph_call_mismatch(
 def are_same_graph_modules(
     fn_name: str, a_mod: GraphModule, b_mod: GraphModule, fake_mode: "FakeTensorMode"
 ) -> bool:
-    from torch._subclasses._fake_tensor_utils import _CacheKeyState
     from torch._subclasses.fake_tensor import extract_tensor_metadata
 
     def log_mismatch(
@@ -1219,24 +1218,14 @@ def are_same_graph_modules(
                         b_node,
                     )
                     return False
-                # Extract fake tensor metadata for a and b and then compare
-                # pyrefly: ignore [implicit-any]
-                a_result = []
-                state = _CacheKeyState(fake_mode.shape_env)
                 a_metadata = extract_tensor_metadata(a_value)
-                a_metadata._flatten_into(a_result, fake_mode, state)
-
-                b_result = []
-                state = _CacheKeyState(fake_mode.shape_env)
                 b_metadata = extract_tensor_metadata(b_value)
-                b_metadata._flatten_into(b_result, fake_mode, state)
                 mismatch_detail = _tensor_metadata_graph_call_mismatch(
                     a_metadata, b_metadata, fake_mode
                 )
                 if mismatch_detail is not None:
                     log_mismatch(
-                        f"placeholder tensor metadata mismatch: {mismatch_detail}; "
-                        f"{a_result} != {b_result}",
+                        f"placeholder tensor metadata mismatch: {mismatch_detail}",
                         a_node,
                         b_node,
                     )
@@ -4001,7 +3990,7 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         set_subgraph_inputs: Literal[
             "automatic", "automatic_with_forced_inputs"
         ] = "automatic",
-        install_subgraph_kwargs: dict[str, Any] | None = None,
+        reuse_group_key: int | None = None,
     ) -> tuple[
         tuple[Proxy, ...],
         dict[str, VariableTracker],
@@ -4036,15 +4025,25 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         )
 
         body_gmod = torch.fx.GraphModule(tx.output.nn_modules, body_graph)
-        body_name = self.install_subgraph_in_output_graph(
-            tx,
-            fn_vt,
-            fn_args_vt,
-            kwargs,
-            body_gmod,
-            attr_name=subgraph_name,
-            **(install_subgraph_kwargs or {}),
-        )
+        if reuse_group_key is None:
+            body_name = self.install_subgraph_in_output_graph(
+                tx,
+                fn_vt,
+                fn_args_vt,
+                kwargs,
+                body_gmod,
+                attr_name=subgraph_name,
+            )
+        else:
+            body_name = self.install_subgraph_in_output_graph(
+                tx,
+                fn_vt,
+                fn_args_vt,
+                kwargs,
+                body_gmod,
+                attr_name=subgraph_name,
+                reuse_group_key=reuse_group_key,
+            )
         body_node = make_attr(tx, body_name)
 
         if set_subgraph_inputs == "automatic_with_forced_inputs":

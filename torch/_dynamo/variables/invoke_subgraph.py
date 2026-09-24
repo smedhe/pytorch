@@ -187,8 +187,6 @@ class InputFingerprint(NamedTuple):
     has_unknown: bool = False
     # TreeSpec from pytree.tree_flatten of the (args, kwargs) structure.
     treespec: pytree.TreeSpec | None = None
-    # Debug descriptions for leaves that made has_unknown true.
-    unknown_vt_descriptions: list[str] | None = None
 
 
 def is_constant_like(
@@ -295,17 +293,12 @@ def build_fingerprint_with_pytree(
     flat_vts: list[tuple[InputTag, VariableTracker]] = []
     arg_sources: list[Source | None] = []
     has_unknown = False
-    unknown_vt_descriptions: list[str] = []
-
-    def describe_unknown_vt(vt: VariableTracker) -> str:
-        return f"{type(vt).__name__}(source={getattr(vt, 'source', None)!r}, vt={vt!r})"
 
     def add_leaf(vt: VariableTracker) -> None:
         nonlocal has_unknown
         tag = classify_vt(vt)
         if tag is None:
             has_unknown = True
-            unknown_vt_descriptions.append(describe_unknown_vt(vt))
         else:
             flat_vts.append((tag, vt))
             # Always append (even None) to keep positional alignment with flat_vts.
@@ -317,7 +310,6 @@ def build_fingerprint_with_pytree(
             node_type = node_vt.python_type()
         except NotImplementedError:
             has_unknown = True
-            unknown_vt_descriptions.append(describe_unknown_vt(node_vt))
             return pytree.treespec_leaf()
         # Keep in sync with pytree._get_node_type.
         if pytree.is_namedtuple_class(node_type):
@@ -352,13 +344,7 @@ def build_fingerprint_with_pytree(
     container_vt = SourcelessBuilder.create(tx, (list(fn_args_vt), kwargs))
     treespec = flatten(container_vt)
 
-    return InputFingerprint(
-        flat_vts,
-        arg_sources,
-        has_unknown,
-        treespec,
-        unknown_vt_descriptions or None,
-    )
+    return InputFingerprint(flat_vts, arg_sources, has_unknown, treespec)
 
 
 def sym_num_key(sym_num: Any) -> Any:
@@ -526,10 +512,7 @@ def is_reuse_eligible(
         return False
 
     if fingerprint.has_unknown:
-        hc_log.debug(
-            "subgraph_reuse: not eligible -- unsupported input VT types: %s",
-            fingerprint.unknown_vt_descriptions,
-        )
+        hc_log.debug("subgraph_reuse: not eligible -- unsupported input VT types")
         return False
 
     return True
@@ -1455,7 +1438,7 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
                 kwargs,
                 self._HOP_NAME,
                 subgraph_name=subgraph_name,
-                install_subgraph_kwargs={"reuse_group_key": export_reuse_group_key},
+                reuse_group_key=export_reuse_group_key,
             )
 
         if len(p_kwargs) > 0:
